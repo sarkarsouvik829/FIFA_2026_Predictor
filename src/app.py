@@ -823,7 +823,7 @@ def _render_fixture_row(
     # Reasoning expander — full width, below the row
     rsn = st.session_state.get(f"rsn_fx_{idx}")
     if rsn:
-        with st.expander(f"📊  Why? — data behind this prediction", expanded=False):
+        with st.expander("Data Behind this Prediction", expanded=False):
             st.markdown(_render_reasoning_html(rsn), unsafe_allow_html=True)
 
 
@@ -900,6 +900,9 @@ def _accuracy_hero_html(live_by_idx: dict[int, str]) -> str:
     if not checks_list:
         return (
             '<div class="wc-acc-hero">'
+            '<div style="width:100%;color:#ffe08a;font-size:0.78rem;font-weight:700;'
+            'letter-spacing:0.09em;text-transform:uppercase;margin-bottom:8px">'
+            'Predictions so far</div>'
             '<div class="acc-sub" style="text-align:center;padding:10px">'
             "<b>Live FT scores</b> load from the web for dates up to today. "
             "Finished games get automatic predictions; "
@@ -954,6 +957,9 @@ def _accuracy_hero_html(live_by_idx: dict[int, str]) -> str:
 
     return (
         '<div class="wc-acc-hero">'
+        '<div style="width:100%;color:#ffe08a;font-size:0.78rem;font-weight:700;'
+        'letter-spacing:0.09em;text-transform:uppercase;margin-bottom:8px">'
+        'Predictions so far</div>'
         f'<div class="acc-block">'
         f'<div class="acc-val" style="color:{col_r}">{r_hit}/{n}</div>'
         f'<div class="acc-lbl">Match Result</div>'
