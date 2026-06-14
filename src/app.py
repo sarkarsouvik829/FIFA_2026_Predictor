@@ -398,6 +398,9 @@ _CSS = """
             word-break: break-word;
         }
 
+        /* Date label: white on mobile for legibility */
+        .fx-date { color: #ffffff !important; }
+
         /* Shrink heading levels */
         h3, h4, h5 { font-size: 0.9rem !important; }
 
@@ -777,7 +780,7 @@ def _render_fixture_row(
     home, away = fx["home"], fx["away"]
     actual = _effective_actual(fx, live_by_idx)
     date_bit = (
-        f'<span style="color:#6fa8c0;font-size:0.68rem">{fx["date"][5:]} &nbsp;</span>'
+        f'<span class="fx-date">{fx["date"][5:]} &nbsp;</span>'
         if show_date else ""
     )
 
