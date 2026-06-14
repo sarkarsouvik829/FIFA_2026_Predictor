@@ -431,8 +431,24 @@ _CSS = """
             gap: 6px;
         }
 
-        /* Date input: full width */
-        [data-testid="stDateInput"] > div { width: 100% !important; }
+        /* Date input: full width, light label, legible text */
+        [data-testid="stDateInput"],
+        [data-testid="stDateInput"] > div,
+        [data-testid="stDateInput"] input {
+            width: 100% !important;
+            min-width: 0 !important;
+            box-sizing: border-box !important;
+        }
+        [data-testid="stDateInput"] input {
+            color: #0d1f2d !important;
+            font-size: 1rem !important;
+            min-height: 44px !important;
+        }
+        [data-testid="stDateInput"] [data-testid="stWidgetLabel"],
+        [data-testid="stDateInput"] [data-testid="stWidgetLabel"] p {
+            color: #f4f9ff !important;
+            font-size: 0.88rem !important;
+        }
 
         /* Compact wc-result card */
         .wc-result { padding: 0.75rem 0.9rem; }
