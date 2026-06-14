@@ -164,6 +164,42 @@ def _ds(name: str, team_set: set) -> str | None:
     return None
 
 
+# ── Adidas Trionda 2026 ball SVG ─────────────────────────────────────────────
+_BALL_SVG = """
+<svg viewBox="0 0 100 100" width="62" height="62" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <radialGradient id="ballBase" cx="36%" cy="30%" r="72%">
+      <stop offset="0%" stop-color="#f8f8ff"/>
+      <stop offset="100%" stop-color="#bfc4da"/>
+    </radialGradient>
+    <radialGradient id="ballGlow" cx="30%" cy="26%" r="38%">
+      <stop offset="0%" stop-color="rgba(255,255,255,0.82)"/>
+      <stop offset="100%" stop-color="rgba(255,255,255,0)"/>
+    </radialGradient>
+    <radialGradient id="ballEdge" cx="50%" cy="50%" r="50%">
+      <stop offset="62%" stop-color="rgba(0,0,0,0)"/>
+      <stop offset="100%" stop-color="rgba(10,10,40,0.42)"/>
+    </radialGradient>
+    <clipPath id="bc">
+      <circle cx="50" cy="50" r="46"/>
+    </clipPath>
+  </defs>
+  <!-- Sphere base -->
+  <circle cx="50" cy="50" r="46" fill="url(#ballBase)" stroke="#14112b" stroke-width="1.5"/>
+  <!-- Dark navy pentagons (top & sides) -->
+  <polygon points="50,9  64,21 59,41 41,41 36,21" fill="#14112b" clip-path="url(#bc)"/>
+  <polygon points="10,32 27,23 36,41 21,53  5,45"  fill="#14112b" clip-path="url(#bc)"/>
+  <polygon points="90,32 73,23 64,41 79,53 95,45"  fill="#14112b" clip-path="url(#bc)"/>
+  <!-- Red pentagons (bottom & sides — Trionda accent colour) -->
+  <polygon points="50,91 64,79 59,59 41,59 36,79" fill="#c1121f" clip-path="url(#bc)"/>
+  <polygon points="10,68 27,77 36,59 21,47  5,55"  fill="#c1121f" clip-path="url(#bc)"/>
+  <polygon points="90,68 73,77 64,59 79,47 95,55"  fill="#c1121f" clip-path="url(#bc)"/>
+  <!-- Lighting -->
+  <circle cx="50" cy="50" r="46" fill="url(#ballGlow)" clip-path="url(#bc)"/>
+  <circle cx="50" cy="50" r="46" fill="url(#ballEdge)" clip-path="url(#bc)"/>
+</svg>
+"""
+
 # ── CSS ───────────────────────────────────────────────────────────────────────
 _CSS = """
 <style>
@@ -235,6 +271,18 @@ _CSS = """
     .wc-acc-hero .acc-sub {
         font-size: 0.72rem; color: #b8d4ea; margin-top: 6px; line-height: 1.35;
     }
+    /* Rotating ball */
+    @keyframes ball-spin {
+        from { transform: rotate(0deg); }
+        to   { transform: rotate(360deg); }
+    }
+    .wc-ball {
+        display: inline-flex;
+        animation: ball-spin 5s linear infinite;
+        filter: drop-shadow(0 4px 10px rgba(0,0,0,0.55));
+        flex-shrink: 0;
+    }
+
     /* Responsive reasoning grid — 3 cols on desktop, 1 on mobile */
     .rsn-grid {
         display: grid;
@@ -338,7 +386,8 @@ _CSS = """
             margin-bottom: 0.6rem;
             border-radius: 10px;
         }
-        .wc-hero h1 { font-size: 1.1rem; letter-spacing: 0.02em; }
+        .wc-hero h1 { font-size: 1.05rem; letter-spacing: 0.02em; }
+        .wc-ball svg { width: 42px !important; height: 42px !important; }
         .wc-hero p  { font-size: 0.8rem; }
         .wc-badge   { font-size: 0.6rem; padding: 0.15rem 0.4rem; }
 
@@ -1007,7 +1056,13 @@ def main() -> None:
 
     st.markdown(
         '<div class="wc-hero"><div class="wc-badge">USA · CAN · MEX 2026</div>'
-        '<h1>⚽ FIFA World Cup 2026 — Match Predictor</h1>'
+        '<div style="display:flex;align-items:center;gap:14px;flex-wrap:nowrap">'
+        f'<span class="wc-ball">{_BALL_SVG}</span>'
+        '<h1 style="margin:0;font-family:\'Segoe UI\',system-ui,sans-serif;'
+        'font-size:1.65rem;font-weight:700;letter-spacing:0.04em;'
+        'color:#fff8e8;text-shadow:0 1px 4px rgba(0,0,0,0.45)">'
+        'FIFA World Cup 2026 — Match Predictor</h1>'
+        '</div>'
         '</div>',
         unsafe_allow_html=True,
     )
