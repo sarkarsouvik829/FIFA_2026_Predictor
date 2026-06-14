@@ -229,6 +229,14 @@ _CSS = """
     .wc-acc-hero .acc-sub {
         font-size: 0.72rem; color: #b8d4ea; margin-top: 6px; line-height: 1.35;
     }
+    /* Responsive reasoning grid — 3 cols on desktop, 1 on mobile */
+    .rsn-grid {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 12px;
+        margin-bottom: 12px;
+    }
+
     .stTabs [data-baseweb="tab-list"] {
         gap: 4px; background: rgba(0,0,0,0.18); padding: 5px 6px; border-radius: 10px;
         flex-wrap: wrap;
@@ -332,7 +340,8 @@ _CSS = """
         .wc-acc-hero .acc-val { font-size: 1.45rem; }
 
         /* Stack Streamlit columns vertically */
-        [data-testid="stHorizontalBlock"] {
+        [data-testid="stHorizontalBlock"],
+        [data-testid="stColumns"] {
             flex-direction: column !important;
             gap: 0 !important;
         }
@@ -342,6 +351,14 @@ _CSS = """
             width: 100% !important;
             flex: 1 1 100% !important;
         }
+
+        /* Reasoning grid: single column on mobile */
+        .rsn-grid {
+            grid-template-columns: 1fr !important;
+        }
+
+        /* Hide table-header row on mobile (columns stack, headers make no sense) */
+        .pred-col-header { display: none !important; }
 
         /* Group tabs in Fixtures tab — scroll horizontally, don't wrap */
         .stTabs [data-baseweb="tab-list"] {
@@ -566,11 +583,16 @@ def _fixture_result_html(res: dict, actual: str | None = None) -> str:
                      f'</span> &nbsp;')
 
     line = (
-        f'<b style="color:#9cf0c0">{p_home*100:.0f}%</b> {a} &nbsp;'
-        f'<span style="color:#aaa">| Draw <b>{p_draw*100:.0f}%</b> |</span>&nbsp; '
-        f'{b} <b style="color:#9cf0c0">{p_away*100:.0f}%</b>'
+        f'<span style="white-space:nowrap"><b style="color:#9cf0c0">{p_home*100:.0f}%</b> {a}</span>'
+        f' <span style="color:#aaa;white-space:nowrap">| Draw <b>{p_draw*100:.0f}%</b> |</span>'
+        f' <span style="white-space:nowrap">{b} <b style="color:#9cf0c0">{p_away*100:.0f}%</b></span>'
     )
-    return f'<div class="fx-pred">⚡ {line}<br>{score_bit}{checks_html}</div>'
+    return (
+        f'<div class="fx-pred">⚡ '
+        f'<span style="display:inline-flex;flex-wrap:wrap;gap:2px 4px;align-items:baseline">'
+        f'{line}</span>'
+        f'<br>{score_bit}{checks_html}</div>'
+    )
 
 
 def _outcome_from_actual(actual: str | None) -> str | None:
@@ -666,7 +688,7 @@ def _render_reasoning_html(rsn: dict) -> str:
         else:
             wlbl = f'<span style="color:#ef4444;font-weight:700">{b[:14]} win</span>'
         h2h_body += (
-            f'<div style="display:flex;gap:8px;font-size:0.72rem;padding:3px 0;'
+            f'<div style="display:flex;flex-wrap:wrap;gap:3px 8px;font-size:0.72rem;padding:3px 0;'
             f'border-bottom:1px solid rgba(255,255,255,0.05)">'
             f'<span style="color:#6fa8c0;min-width:52px">{m["date"][:7]}</span>'
             f'<span style="color:#dceaf5;flex:1">{html.escape(m["home"])} '
@@ -684,8 +706,8 @@ def _render_reasoning_html(rsn: dict) -> str:
     )
 
     return (
-        # ── Elo ──────────────────────────────────────────────────────────
-        '<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;margin-bottom:12px">'
+        # ── Elo / Form / H2H — responsive 3-col grid (1-col on mobile) ──
+        '<div class="rsn-grid">'
 
         # Elo block
         '<div><div style="color:#ffe08a;font-size:0.65rem;font-weight:700;letter-spacing:0.09em;'
@@ -1028,7 +1050,7 @@ def main() -> None:
             hc1, hc2, hc3 = st.columns([4, 1.4, 3])
             for col, lbl in zip((hc1, hc2, hc3), ("Match / Venue", "", "Prediction")):
                 col.markdown(
-                    f'<div style="color:#ffe08a;font-size:0.68rem;font-weight:700;'
+                    f'<div class="pred-col-header" style="color:#ffe08a;font-size:0.68rem;font-weight:700;'
                     f'letter-spacing:0.08em;padding-bottom:4px;'
                     f'border-bottom:1px solid rgba(255,210,120,0.3)">{lbl}</div>',
                     unsafe_allow_html=True,
