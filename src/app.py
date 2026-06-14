@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import html
 import re
 import sys
@@ -162,6 +163,20 @@ def _ds(name: str, team_set: set) -> str | None:
         if candidate in team_set:
             return candidate
     return None
+
+
+# ── Adidas ball image (base64 so it works in st.markdown HTML) ───────────────
+def _ball_img_tag(width: int = 60) -> str:
+    path = _ROOT / "adidas-ball-image.png"
+    if path.exists():
+        b64 = base64.b64encode(path.read_bytes()).decode()
+        return (
+            f'<img src="data:image/png;base64,{b64}" '
+            f'width="{width}" height="{width}" '
+            f'style="object-fit:contain;flex-shrink:0;'
+            f'filter:drop-shadow(0 3px 8px rgba(0,0,0,0.5))">'
+        )
+    return "⚽"
 
 
 # ── CSS ───────────────────────────────────────────────────────────────────────
@@ -338,7 +353,8 @@ _CSS = """
             margin-bottom: 0.6rem;
             border-radius: 10px;
         }
-        .wc-hero h1 { font-size: 1.1rem; letter-spacing: 0.02em; }
+        .wc-hero h1 { font-size: 1.05rem; letter-spacing: 0.02em; }
+        .wc-hero img { width: 40px !important; height: 40px !important; }
         .wc-hero p  { font-size: 0.8rem; }
         .wc-badge   { font-size: 0.6rem; padding: 0.15rem 0.4rem; }
 
@@ -400,6 +416,12 @@ _CSS = """
 
         /* Date label: white on mobile for legibility */
         .fx-date { color: #ffffff !important; }
+
+        /* Widget labels (e.g. "Match date") — force light colour on mobile */
+        [data-testid="stWidgetLabel"],
+        [data-testid="stWidgetLabel"] p,
+        [data-testid="stWidgetLabel"] span,
+        label[data-testid="stWidgetLabel"] { color: #f4f9ff !important; }
 
         /* Shrink heading levels */
         h3, h4, h5 { font-size: 0.9rem !important; }
@@ -1007,7 +1029,13 @@ def main() -> None:
 
     st.markdown(
         '<div class="wc-hero"><div class="wc-badge">USA · CAN · MEX 2026</div>'
-        '<h1>⚽ FIFA World Cup 2026 — Match Predictor</h1>'
+        '<div style="display:flex;align-items:center;gap:14px;flex-wrap:nowrap">'
+        f'{_ball_img_tag(60)}'
+        '<h1 style="margin:0;font-family:\'Segoe UI\',system-ui,sans-serif;'
+        'font-size:1.65rem;font-weight:700;letter-spacing:0.04em;'
+        'color:#fff8e8;text-shadow:0 1px 4px rgba(0,0,0,0.45)">'
+        'FIFA World Cup 2026 — Match Predictor</h1>'
+        '</div>'
         '</div>',
         unsafe_allow_html=True,
     )
