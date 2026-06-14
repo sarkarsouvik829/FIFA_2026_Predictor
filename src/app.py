@@ -920,15 +920,15 @@ def _accuracy_hero_html(live_by_idx: dict[int, str]) -> str:
         score_block = (
             f'<div class="acc-block">'
             f'<div class="acc-val" style="color:{col_s}">{s_hit}/{s_den}</div>'
-            f'<div class="acc-lbl">Exact scoreline</div>'
-            f'<div class="acc-sub">{acc_s:.0f}% &nbsp;·&nbsp; vs FT</div></div>'
+            f'<div class="acc-lbl">Exact Score</div>'
+            f'<div class="acc-sub">{acc_s:.0f}% accuracy</div></div>'
         )
     else:
         score_block = (
             '<div class="acc-block">'
             '<div class="acc-val" style="color:#6b7f93">—</div>'
-            f'<div class="acc-lbl">Exact scoreline</div>'
-            f'<div class="acc-sub">Need goal preds ({n} match{"es" if n != 1 else ""})</div></div>'
+            f'<div class="acc-lbl">Exact Score</div>'
+            f'<div class="acc-sub">Pending predictions</div></div>'
         )
 
     if gd_den:
@@ -937,23 +937,23 @@ def _accuracy_hero_html(live_by_idx: dict[int, str]) -> str:
         gd_block = (
             f'<div class="acc-block">'
             f'<div class="acc-val" style="color:{col_g}">{gd_hit}/{gd_den}</div>'
-            f'<div class="acc-lbl">Goal difference</div>'
-            f'<div class="acc-sub">{acc_g:.0f}% &nbsp;·&nbsp; pred vs FT GD</div></div>'
+            f'<div class="acc-lbl">Goal Difference</div>'
+            f'<div class="acc-sub">{acc_g:.0f}% accuracy</div></div>'
         )
     else:
         gd_block = (
             '<div class="acc-block">'
             '<div class="acc-val" style="color:#6b7f93">—</div>'
-            '<div class="acc-lbl">Goal difference</div>'
-            '<div class="acc-sub">Same as scoreline</div></div>'
+            '<div class="acc-lbl">Goal Difference</div>'
+            '<div class="acc-sub">See Exact Score</div></div>'
         )
 
     return (
         '<div class="wc-acc-hero">'
         f'<div class="acc-block">'
         f'<div class="acc-val" style="color:{col_r}">{r_hit}/{n}</div>'
-        f'<div class="acc-lbl">Match result (1×2)</div>'
-        f'<div class="acc-sub">{acc_r:.0f}% &nbsp;·&nbsp; argmax(home/draw/away %)</div>'
+        f'<div class="acc-lbl">Match Result</div>'
+        f'<div class="acc-sub">{acc_r:.0f}% accuracy</div>'
         f"</div>"
         f"{score_block}"
         f"{gd_block}"
@@ -994,8 +994,7 @@ def main() -> None:
 
     st.markdown(
         '<div class="wc-hero"><div class="wc-badge">USA · CAN · MEX 2026</div>'
-        '<h1>⚽ FIFA World Cup 2026 — Match predictor</h1>'
-        '<p>Elo + form features · XGBoost · 2026 fixture schedule · live FT for completed games</p>'
+        '<h1>⚽ FIFA World Cup 2026 — Match Predictor</h1>'
         '</div>',
         unsafe_allow_html=True,
     )
