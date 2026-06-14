@@ -167,8 +167,14 @@ def _ds(name: str, team_set: set) -> str | None:
 # ── CSS ───────────────────────────────────────────────────────────────────────
 _CSS = """
 <style>
+    html, body {
+        background-color: #1a3352 !important;
+    }
     .stApp {
+        background-color: #1a3352;
         background: linear-gradient(165deg, #1a3352 0%, #1e3f5e 38%, #1a3550 100%);
+        background-attachment: fixed;
+        min-height: 100vh;
         color: #eef6fc;
     }
     .main .block-container { color: #eef6fc; }
@@ -765,9 +771,7 @@ def _render_fixture_row(
     tab_prefix: str = "tab",
     live_by_idx: dict[int, str] | None = None,
 ) -> None:
-    """Render one fixture row: [match + venue] | [button] | [result].
-    On mobile the three columns stack vertically in that order.
-    """
+    """Render one fixture row: match+venue (full-width) then button | result columns."""
     live_by_idx = live_by_idx or {}
     idx = fx["_idx"]
     home, away = fx["home"], fx["away"]
@@ -777,20 +781,20 @@ def _render_fixture_row(
         if show_date else ""
     )
 
-    # 3 columns: match+venue block | action (button or FT) | result
-    c_info, c_btn, c_res = st.columns([4, 1.4, 3])
+    # Full-width match name + venue — always visible on every screen size
+    st.markdown(
+        f'<div style="padding:5px 0 2px">{date_bit}'
+        f'<span style="color:#eef6fc;font-weight:600">'
+        f'{html.escape(home)} <span style="color:#5a90b0">vs</span> {html.escape(away)}'
+        f'</span>'
+        f'<div style="color:#7aa8c0;font-size:0.7rem;font-style:italic;margin-top:2px">'
+        f'📍 {html.escape(fx["venue"])}</div>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
 
-    with c_info:
-        st.markdown(
-            f'<div style="padding:5px 0">{date_bit}'
-            f'<span style="color:#eef6fc;font-weight:600">'
-            f'{html.escape(home)} <span style="color:#5a90b0">vs</span> {html.escape(away)}'
-            f'</span>'
-            f'<div style="color:#7aa8c0;font-size:0.7rem;font-style:italic;margin-top:1px">'
-            f'📍 {html.escape(fx["venue"])}</div>'
-            f'</div>',
-            unsafe_allow_html=True,
-        )
+    # 2 columns: action (button or FT score) | prediction result
+    c_btn, c_res = st.columns([1.5, 4])
 
     with c_btn:
         if actual:
@@ -1045,15 +1049,14 @@ def main() -> None:
                 unsafe_allow_html=True,
             )
 
-            # Column headers
-            hc1, hc2, hc3 = st.columns([4, 1.4, 3])
-            for col, lbl in zip((hc1, hc2, hc3), ("Match / Venue", "", "Prediction")):
-                col.markdown(
-                    f'<div class="pred-col-header" style="color:#ffe08a;font-size:0.68rem;font-weight:700;'
-                    f'letter-spacing:0.08em;padding-bottom:4px;'
-                    f'border-bottom:1px solid rgba(255,210,120,0.3)">{lbl}</div>',
-                    unsafe_allow_html=True,
-                )
+            # Column header (prediction column only — match/venue is now full-width)
+            _, hc_pred = st.columns([1.5, 4])
+            hc_pred.markdown(
+                '<div class="pred-col-header" style="color:#ffe08a;font-size:0.68rem;font-weight:700;'
+                'letter-spacing:0.08em;padding-bottom:4px;'
+                'border-bottom:1px solid rgba(255,210,120,0.3)">Prediction</div>',
+                unsafe_allow_html=True,
+            )
 
             for fx in day_fx:
                 _render_fixture_row(
