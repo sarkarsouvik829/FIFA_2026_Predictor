@@ -171,10 +171,12 @@ def _ball_img_tag(width: int = 60) -> str:
     if path.exists():
         b64 = base64.b64encode(path.read_bytes()).decode()
         return (
+            f'<span class="wc-ball">'
             f'<img src="data:image/png;base64,{b64}" '
             f'width="{width}" height="{width}" '
-            f'style="object-fit:contain;flex-shrink:0;'
+            f'style="object-fit:contain;display:block;'
             f'filter:drop-shadow(0 3px 8px rgba(0,0,0,0.5))">'
+            f'</span>'
         )
     return "⚽"
 
@@ -182,6 +184,16 @@ def _ball_img_tag(width: int = 60) -> str:
 # ── CSS ───────────────────────────────────────────────────────────────────────
 _CSS = """
 <style>
+    @keyframes ball-spin {
+        from { transform: rotate(0deg); }
+        to   { transform: rotate(360deg); }
+    }
+    .wc-ball {
+        animation: ball-spin 5s linear infinite;
+        display: inline-block;
+        flex-shrink: 0;
+    }
+
     html, body {
         background-color: #1a3352 !important;
     }
