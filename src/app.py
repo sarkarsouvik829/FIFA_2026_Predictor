@@ -455,6 +455,13 @@ _CSS = """
             color: #0d1f2d !important;
             font-size: 1rem !important;
             min-height: 44px !important;
+            background-color: #ffffff !important;
+            border-radius: 6px !important;
+        }
+        [data-testid="stDateInput"] [data-baseweb="input"],
+        [data-testid="stDateInput"] [data-baseweb="base-input"] {
+            background-color: #ffffff !important;
+            border-radius: 6px !important;
         }
         [data-testid="stDateInput"] [data-testid="stWidgetLabel"],
         [data-testid="stDateInput"] [data-testid="stWidgetLabel"] p {
