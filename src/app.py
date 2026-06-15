@@ -6,7 +6,9 @@ import base64
 import html
 import re
 import sys
+import unicodedata
 from pathlib import Path
+from typing import Any, Literal
 
 _ROOT = Path(__file__).resolve().parent.parent
 if str(_ROOT) not in sys.path:
@@ -328,6 +330,10 @@ _CSS = """
         border-radius: 6px; padding: 3px 8px;
         font-size: 0.75rem; color: #b8f0cc; margin-top: 2px;
     }
+    .fx-pred-main { font-size: 0.82rem; font-weight: 700; color: #e8fdf0; margin-bottom: 3px; line-height: 1.35; }
+    .fx-pred-ft { font-size: 0.72rem; color: #c5e8d8; margin-bottom: 4px; line-height: 1.4; }
+    .fx-pred-winner { color: #ffe566; font-weight: 800; text-shadow: 0 0 10px rgba(255, 230, 100, 0.25); }
+    .fx-pred-draw { color: #9cf0ff; font-weight: 800; }
 
     /* KO fixture row */
     .ko-row {
@@ -503,18 +509,58 @@ def _effective_actual(fx: dict, live_by_idx: dict[int, str]) -> str | None:
     return live_by_idx.get(fx["_idx"]) or fx.get("actual")
 
 
+def _pred_scoreline_ints(res: dict) -> tuple[int, int] | None:
+    """Integer pred score (team A = home), same rule as the Pred score UI line."""
+    if "team_a_expected_goals" not in res or "team_b_expected_goals" not in res:
+        return None
+    try:
+        a = int(float(res["team_a_expected_goals"]))
+        b = int(float(res["team_b_expected_goals"]))
+    except (TypeError, ValueError):
+        return None
+    return a, b
+
+
+def _sign1x2(home_goals: int, away_goals: int) -> int:
+    """1 = home win, 0 = draw, -1 = away win (same bucket as home/away goals)."""
+    return (home_goals > away_goals) - (home_goals < away_goals)
+
+
 def _predicted_outcome_max_prob(res: dict) -> str | None:
-    """Predicted 1×2 outcome = argmax(home win %, draw %, away win %) from three-way split."""
+    """Predicted 1×2 from (p_home, p_draw, p_away). Ties do not default to home (fixes 35/30/35 → draw)."""
     if "_err" in res:
         return None
     pa_raw = res["team_a_win_probability"]
     p_home, p_draw, p_away = _three_way(pa_raw)
     probs = {"home": p_home, "draw": p_draw, "away": p_away}
-    best = "home"
-    for k in ("draw", "away"):
-        if probs[k] > probs[best]:
-            best = k
-    return best
+    max_p = max(probs.values())
+    tops = [k for k, v in probs.items() if v >= max_p - 1e-9]
+    if len(tops) == 1:
+        return tops[0]
+    if "draw" in tops:
+        return "draw"
+    if "home" in tops and "away" in tops:
+        return "draw"
+    return tops[0]
+
+
+def _predicted_winner_name(res: dict) -> str:
+    """Plain label: home team name, away team name, or Draw (same rule as 1×2 checks)."""
+    ta, tb = res["team_a"], res["team_b"]
+    si = _pred_scoreline_ints(res)
+    if si is not None:
+        ha, aa = si
+        if ha > aa:
+            return ta
+        if aa > ha:
+            return tb
+        return "Draw"
+    po = _predicted_outcome_max_prob(res)
+    if po == "home":
+        return ta
+    if po == "away":
+        return tb
+    return "Draw"
 
 
 def _prediction_checks(res: dict, actual: str | None) -> dict | None:
@@ -522,7 +568,10 @@ def _prediction_checks(res: dict, actual: str | None) -> dict | None:
     Hierarchical evaluation (user rules):
     1. Exact scoreline → score ✓, GD ✓, result ✓.
     2. Else → score ✗; GD ✓ iff predicted GD equals actual GD; result ✓ iff
-       argmax(p_home, p_draw, p_away) matches the true 1×2 outcome.
+       the predicted 1×2 matches FT. When expected goals are present, predicted
+       1×2 is derived from the integer pred score (same frame as UI); otherwise
+       it is the top outcome among (p_home, p_draw, p_away), with ties resolved
+       so symmetric home/away mass does not default to a home win (e.g. 35/30/35 → draw).
     """
     if not actual or "_err" in res:
         return None
@@ -530,26 +579,24 @@ def _prediction_checks(res: dict, actual: str | None) -> dict | None:
     if not goals:
         return None
     gh, ga = goals
-    true_out = _outcome_from_actual(actual)
-    if not true_out:
+    act_sign = _sign1x2(gh, ga)
+
+    pred_from_prob = _predicted_outcome_max_prob(res)
+    if pred_from_prob is None:
         return None
 
-    ph = res.get("team_a_expected_goals")
-    pb = res.get("team_b_expected_goals")
-    pred_max = _predicted_outcome_max_prob(res)
-    if pred_max is None:
-        return None
-
-    if ph is None or pb is None:
+    score_ints = _pred_scoreline_ints(res)
+    if score_ints is None:
+        pred_s = {"home": 1, "draw": 0, "away": -1}[pred_from_prob]
         return {
-            "result_ok": pred_max == true_out,
+            "result_ok": pred_s == act_sign,
             "score_ok": None,
             "gd_ok": None,
             "exact": False,
             "show_gd_note": False,
         }
 
-    ph_i, pb_i = int(ph), int(pb)
+    ph_i, pb_i = score_ints
     exact = ph_i == gh and pb_i == ga
     if exact:
         return {
@@ -561,8 +608,9 @@ def _prediction_checks(res: dict, actual: str | None) -> dict | None:
         }
 
     gd_ok = (ph_i - pb_i) == (gh - ga)
+    result_ok = _sign1x2(ph_i, pb_i) == act_sign
     return {
-        "result_ok": pred_max == true_out,
+        "result_ok": result_ok,
         "score_ok": False,
         "gd_ok": gd_ok,
         "exact": False,
@@ -604,15 +652,32 @@ def _checks_rows_html(ch: dict) -> str:
 
 
 def _goals_from_actual(actual: str | None) -> tuple[int, int] | None:
+    """Parse fixture home–away goals from FT text (handles NFKC + common dash characters)."""
     if not actual:
         return None
-    parts = [x.strip() for x in re.split(r"\s*[-–—]\s*", actual.strip())]
+    s = unicodedata.normalize("NFKC", actual.strip())
+    # Unicode dashes / hyphen used by ESPN, docs, or copy-paste
+    sep = r"[-–—−‒⁃]"
+    parts = [p.strip() for p in re.split(rf"\s*{sep}\s*", s)]
     if len(parts) != 2:
         return None
     try:
         return int(parts[0]), int(parts[1])
     except ValueError:
         return None
+
+
+def _ft_winner_name(team_a: str, team_b: str, actual: str) -> str | None:
+    """FT 1×2 as team_a name, team_b name, or Draw; None if score not parsed."""
+    g = _goals_from_actual(actual)
+    if not g:
+        return None
+    gh, ga = g
+    if gh > ga:
+        return team_a
+    if ga > gh:
+        return team_b
+    return "Draw"
 
 
 def _three_way(pa_raw: float) -> tuple[float, float, float]:
@@ -631,48 +696,62 @@ def _three_way(pa_raw: float) -> tuple[float, float, float]:
 
 
 def _fixture_result_html(res: dict, actual: str | None = None) -> str:
-    """Three-way probabilities + pred score + three evaluation rows vs FT."""
-    a = html.escape(res["team_a"])
-    b = html.escape(res["team_b"])
-    pa_raw = res["team_a_win_probability"]
-    p_home, p_draw, p_away = _three_way(pa_raw)
+    """Predicted winner (or Draw) + pred score + vs-FT winner check + score/GD rows."""
+    ta_raw, tb_raw = res["team_a"], res["team_b"]
+    pred_lbl = _predicted_winner_name(res)
+    pred_esc = html.escape(pred_lbl)
+    pred_cls = "fx-pred-draw" if pred_lbl == "Draw" else "fx-pred-winner"
 
-    checks_html = ""
     ch = _prediction_checks(res, actual) if actual else None
-    if ch:
-        checks_html = _checks_rows_html(ch)
+    checks_html = _checks_rows_html(ch) if ch else ""
+
+    ft_line = ""
+    if actual:
+        ft_lbl = _ft_winner_name(ta_raw, tb_raw, actual)
+        if ft_lbl is not None:
+            ft_esc = html.escape(ft_lbl)
+            ft_cls = "fx-pred-draw" if ft_lbl == "Draw" else "fx-pred-winner"
+            cmp_bit = ""
+            if ch is not None and ch.get("result_ok") is not None:
+                if ch["result_ok"]:
+                    cmp_bit = ' <span style="color:#7fd4a0;font-weight:800">· Match ✓</span>'
+                else:
+                    cmp_bit = ' <span style="color:#f08080;font-weight:800">· No match ✗</span>'
+            ft_line = (
+                f'<div class="fx-pred-ft">FT winner: <span class="{ft_cls}">{ft_esc}</span>{cmp_bit}</div>'
+            )
 
     score_bit = ""
-    if "team_a_expected_goals" in res:
-        score_bit = (f'<span style="color:#ffe08a;font-size:0.7rem">'
-                     f'Pred score: {int(res["team_a_expected_goals"])}–{int(res["team_b_expected_goals"])}'
-                     f'</span> &nbsp;')
+    _ps = _pred_scoreline_ints(res)
+    if _ps is not None:
+        score_bit = (
+            f'<span style="color:#ffe08a;font-size:0.7rem">'
+            f'Pred score: {_ps[0]}–{_ps[1]}'
+            f'</span> &nbsp;'
+        )
 
-    line = (
-        f'<span style="white-space:nowrap"><b style="color:#9cf0c0">{p_home*100:.0f}%</b> {a}</span>'
-        f' <span style="color:#aaa;white-space:nowrap">| Draw <b>{p_draw*100:.0f}%</b> |</span>'
-        f' <span style="white-space:nowrap">{b} <b style="color:#9cf0c0">{p_away*100:.0f}%</b></span>'
-    )
     return (
         f'<div class="fx-pred">⚡ '
+        f'<div class="fx-pred-main">Prediction: <span class="{pred_cls}">{pred_esc}</span></div>'
+        f"{ft_line}"
         f'<span style="display:inline-flex;flex-wrap:wrap;gap:2px 4px;align-items:baseline">'
-        f'{line}</span>'
-        f'<br>{score_bit}{checks_html}</div>'
+        f"{score_bit}</span>"
+        f"<br>{checks_html}</div>"
     )
+
+
+def _outcome_from_goals(home_goals: int, away_goals: int) -> str:
+    """1×2 from home/away goals (team A = home in fixture / pred score display)."""
+    s = _sign1x2(home_goals, away_goals)
+    return "home" if s > 0 else ("away" if s < 0 else "draw")
 
 
 def _outcome_from_actual(actual: str | None) -> str | None:
     """'home' | 'draw' | 'away' | None"""
-    if not actual:
+    g = _goals_from_actual(actual)
+    if not g:
         return None
-    parts = [x.strip() for x in re.split(r"\s*[-–—]\s*", actual.strip())]
-    if len(parts) != 2:
-        return None
-    try:
-        gh, ga = int(parts[0]), int(parts[1])
-        return "home" if gh > ga else ("away" if ga > gh else "draw")
-    except ValueError:
-        return None
+    return _outcome_from_goals(g[0], g[1])
 
 
 def _run_prediction(fx: dict, team_set: set, model: str) -> None:
@@ -944,21 +1023,82 @@ def _show_fixtures_tab(team_set: set, fixture_model: str, live_by_idx: dict[int,
             )
 
 
-def _accuracy_hero_html(live_by_idx: dict[int, str]) -> str:
-    """Summary: match result, scoreline, goal-difference accuracy (hierarchical rules)."""
-    checks_list: list[dict] = []
+def _accuracy_eval_rows(live_by_idx: dict[int, str]) -> list[dict[str, Any]]:
+    """Fixtures with FT + stored prediction + check dict (same set as accuracy hero)."""
+    out: list[dict[str, Any]] = []
     for fx in _FIXTURES:
         actual = _effective_actual(fx, live_by_idx)
+        if not actual:
+            continue
         stored = st.session_state.get(f"res_fx_{fx['_idx']}")
         if not stored or "_err" in stored:
             continue
         ch = _prediction_checks(stored, actual)
         if ch is None:
             continue
-        checks_list.append(ch)
+        out.append({"fx": fx, "stored": stored, "ch": ch, "actual": actual})
+    return out
 
-    if not checks_list:
-        return (
+
+def _accuracy_split_ok_bad(
+    rows: list[dict[str, Any]], kind: Literal["result", "score", "gd"]
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    if kind == "result":
+        ok = [r for r in rows if r["ch"].get("result_ok")]
+        bad = [r for r in rows if not r["ch"].get("result_ok")]
+        return ok, bad
+    if kind == "score":
+        sub = [r for r in rows if r["ch"].get("score_ok") is not None]
+        ok = [r for r in sub if r["ch"].get("score_ok")]
+        bad = [r for r in sub if not r["ch"].get("score_ok")]
+        return ok, bad
+    sub = [r for r in rows if r["ch"].get("gd_ok") is not None]
+    ok = [r for r in sub if r["ch"].get("gd_ok")]
+    bad = [r for r in sub if not r["ch"].get("gd_ok")]
+    return ok, bad
+
+
+def _accuracy_match_line_html(r: dict[str, Any]) -> str:
+    fx, stored, actual = r["fx"], r["stored"], r["actual"]
+    ps = _pred_scoreline_ints(stored)
+    pred_sc = f"{ps[0]}–{ps[1]}" if ps is not None else "—"
+    return (
+        f'{html.escape(fx["date"])} · Grp {html.escape(str(fx["group"]))} · '
+        f'{html.escape(fx["home"])} vs {html.escape(fx["away"])} · '
+        f'Pred {html.escape(pred_sc)} · FT {html.escape(actual)}'
+    )
+
+
+def _accuracy_expander_colored(rows: list[dict[str, Any]], kind: Literal["result", "score", "gd"]) -> None:
+    ok, bad = _accuracy_split_ok_bad(rows, kind)
+    parts: list[str] = ['<div style="font-size:0.72rem;line-height:1.45">']
+    if ok:
+        parts.append(
+            '<div style="font-weight:700;margin:0 0 6px 0;color:#7fd4a0">Correct</div>'
+        )
+        for r in ok:
+            parts.append(
+                f'<div style="color:#7fd4a0;margin:2px 0">{_accuracy_match_line_html(r)}</div>'
+            )
+    if bad:
+        parts.append(
+            '<div style="font-weight:700;margin:12px 0 6px 0;color:#f08080">Wrong</div>'
+        )
+        for r in bad:
+            parts.append(
+                f'<div style="color:#f08080;margin:2px 0">{_accuracy_match_line_html(r)}</div>'
+            )
+    if not ok and not bad:
+        parts.append('<div style="color:#8899aa">—</div>')
+    parts.append("</div>")
+    st.markdown("".join(parts), unsafe_allow_html=True)
+
+
+def _render_accuracy_hero(live_by_idx: dict[int, str]) -> None:
+    """Predictions-so-far summary; open MATCH RESULT / EXACT SCORE / GOAL DIFFERENCE for green/red lists."""
+    rows = _accuracy_eval_rows(live_by_idx)
+    if not rows:
+        st.markdown(
             '<div class="wc-acc-hero">'
             '<div style="width:100%;color:#ffe08a;font-size:0.78rem;font-weight:700;'
             'letter-spacing:0.09em;text-transform:uppercase;margin-bottom:8px">'
@@ -966,21 +1106,22 @@ def _accuracy_hero_html(live_by_idx: dict[int, str]) -> str:
             '<div class="acc-sub" style="text-align:center;padding:10px">'
             "<b>Live FT scores</b> load from the web for dates up to today. "
             "Finished games get automatic predictions; "
-            "<b>match result</b>, <b>scoreline</b>, and <b>goal difference</b> checks appear here.</div></div>"
+            "<b>match result</b>, <b>scoreline</b>, and <b>goal difference</b> checks appear here.</div></div>",
+            unsafe_allow_html=True,
         )
+        return
 
-    n = len(checks_list)
-    r_hit = sum(1 for c in checks_list if c.get("result_ok"))
-    score_eval = [c for c in checks_list if c.get("score_ok") is not None]
-    s_den = len(score_eval)
-    s_hit = sum(1 for c in score_eval if c.get("score_ok")) if s_den else 0
-    gd_eval = [c for c in checks_list if c.get("gd_ok") is not None]
-    gd_den = len(gd_eval)
-    gd_hit = sum(1 for c in gd_eval if c.get("gd_ok")) if gd_den else 0
+    n = len(rows)
+    r_hit = sum(1 for r in rows if r["ch"].get("result_ok"))
+    score_sub = [r for r in rows if r["ch"].get("score_ok") is not None]
+    s_den = len(score_sub)
+    s_hit = sum(1 for r in score_sub if r["ch"].get("score_ok")) if s_den else 0
+    gd_sub = [r for r in rows if r["ch"].get("gd_ok") is not None]
+    gd_den = len(gd_sub)
+    gd_hit = sum(1 for r in gd_sub if r["ch"].get("gd_ok")) if gd_den else 0
 
     acc_r = r_hit / n * 100
     col_r = "#7fd4a0" if acc_r >= 60 else "#f0c060" if acc_r >= 40 else "#f08080"
-
     if s_den:
         acc_s = s_hit / s_den * 100
         col_s = "#7fd4a0" if acc_s >= 20 else "#f0c060" if acc_s >= 8 else "#f08080"
@@ -994,8 +1135,8 @@ def _accuracy_hero_html(live_by_idx: dict[int, str]) -> str:
         score_block = (
             '<div class="acc-block">'
             '<div class="acc-val" style="color:#6b7f93">—</div>'
-            f'<div class="acc-lbl">Exact Score</div>'
-            f'<div class="acc-sub">Pending predictions</div></div>'
+            '<div class="acc-lbl">Exact Score</div>'
+            '<div class="acc-sub">Pending predictions</div></div>'
         )
 
     if gd_den:
@@ -1015,20 +1156,44 @@ def _accuracy_hero_html(live_by_idx: dict[int, str]) -> str:
             '<div class="acc-sub">See Exact Score</div></div>'
         )
 
-    return (
+    def _card(val: str, lbl: str, sub: str, col: str) -> str:
+        return (
+            f'<div class="acc-block">'
+            f'<div class="acc-val" style="color:{col}">{val}</div>'
+            f'<div class="acc-lbl">{lbl}</div>'
+            f'<div class="acc-sub">{sub}</div>'
+            f"</div>"
+        )
+
+    st.markdown(
         '<div class="wc-acc-hero">'
         '<div style="width:100%;color:#ffe08a;font-size:0.78rem;font-weight:700;'
         'letter-spacing:0.09em;text-transform:uppercase;margin-bottom:8px">'
         'Predictions so far</div>'
-        f'<div class="acc-block">'
-        f'<div class="acc-val" style="color:{col_r}">{r_hit}/{n}</div>'
-        f'<div class="acc-lbl">Match Result</div>'
-        f'<div class="acc-sub">{acc_r:.0f}% accuracy</div>'
-        f"</div>"
+        f'{_card(f"{r_hit}/{n}", "Match Result", f"{acc_r:.0f}% accuracy", col_r)}'
         f"{score_block}"
         f"{gd_block}"
-        "</div>"
+        "</div>",
+        unsafe_allow_html=True,
     )
+
+    col_a, col_b, col_c = st.columns(3)
+    with col_a:
+        with st.expander("MATCH RESULT", expanded=False):
+            _accuracy_expander_colored(rows, "result")
+    with col_b:
+        with st.expander("EXACT SCORE", expanded=False):
+            if s_den:
+                _accuracy_expander_colored(rows, "score")
+            else:
+                st.caption("Predictions need expected goals before exact score can be judged.")
+    with col_c:
+        with st.expander("GOAL DIFFERENCE", expanded=False):
+            if gd_den:
+                _accuracy_expander_colored(rows, "gd")
+            else:
+                st.caption("Predictions need expected goals before goal difference can be judged.")
+
 
 
 def main() -> None:
@@ -1087,7 +1252,7 @@ def main() -> None:
         for fx in missing_pred:
             _run_prediction(fx, team_set, "xgboost")
 
-    st.markdown(_accuracy_hero_html(live_by_idx), unsafe_allow_html=True)
+    _render_accuracy_hero(live_by_idx)
 
     tab_pred, tab_fix = st.tabs(["⚽  Match predictor", "📋  Fixtures & schedule"])
 
