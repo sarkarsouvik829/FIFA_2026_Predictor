@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
 from typing import Any
+
+from src.wc_atomic_json import write_atomic_json
 
 _CACHE_NAME = "wc_app_cache.json"
 
@@ -44,11 +45,24 @@ def load_triple(root: Path) -> tuple[dict[int, str], dict[int, dict[str, Any]], 
 
 
 def _write_atomic(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".json.tmp")
-    with tmp.open("w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=0, ensure_ascii=False)
-    os.replace(tmp, path)
+    write_atomic_json(path, payload, indent=0)
+
+
+def merge_save_predictions_batch(
+    root: Path,
+    items: list[tuple[int, dict[str, Any], dict[str, Any] | None]],
+) -> bool:
+    """Persist many fixture predictions in one disk write."""
+    if not items:
+        return True
+    cur_l, cur_p, cur_r = load_triple(root)
+    for idx, res, reasoning in items:
+        if "_err" in res:
+            continue
+        cur_p[idx] = res
+        if reasoning is not None:
+            cur_r[idx] = reasoning
+    return save_triple(root, cur_l, cur_p, cur_r)
 
 
 def save_triple(
@@ -56,30 +70,34 @@ def save_triple(
     live_ft: dict[int, str],
     predictions: dict[int, dict[str, Any]],
     reasoning: dict[int, Any],
-) -> None:
-    """Overwrite cache file with full maps (string JSON keys)."""
+) -> bool:
+    """Overwrite cache file with full maps (string JSON keys). Returns False if disk write fails."""
     payload = {
         "version": 1,
         "live_ft": {str(k): v for k, v in live_ft.items()},
         "predictions": {str(k): v for k, v in predictions.items()},
         "reasoning": {str(k): v for k, v in reasoning.items()},
     }
-    _write_atomic(cache_path(root), payload)
+    try:
+        _write_atomic(cache_path(root), payload)
+        return True
+    except OSError:
+        return False
 
 
-def merge_save_live_ft(root: Path, live_by_idx: dict[int, str]) -> None:
+def merge_save_live_ft(root: Path, live_by_idx: dict[int, str]) -> bool:
     """Merge ``live_by_idx`` into on-disk ``live_ft`` and save (preserves predictions)."""
     cur_l, cur_p, cur_r = load_triple(root)
     cur_l.update(live_by_idx)
-    save_triple(root, cur_l, cur_p, cur_r)
+    return save_triple(root, cur_l, cur_p, cur_r)
 
 
-def merge_save_prediction(root: Path, idx: int, res: dict[str, Any], reasoning: dict[str, Any] | None) -> None:
+def merge_save_prediction(root: Path, idx: int, res: dict[str, Any], reasoning: dict[str, Any] | None) -> bool:
     """Store one fixture prediction (+ optional reasoning) and save."""
     if "_err" in res:
-        return
+        return True
     cur_l, cur_p, cur_r = load_triple(root)
     cur_p[idx] = res
     if reasoning is not None:
         cur_r[idx] = reasoning
-    save_triple(root, cur_l, cur_p, cur_r)
+    return save_triple(root, cur_l, cur_p, cur_r)

@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Runtime usage / analytics (local server)
+data/wc_site_visits.json
+data/wc_prediction_log.jsonl
+data/wc_knockout_schedule.json

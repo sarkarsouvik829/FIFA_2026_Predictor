@@ -20,8 +20,15 @@ import streamlit as st
 
 from src.matches_common import load_completed_matches_chronological
 from src.predict_match import MatchPredictor
-from src.wc_disk_cache import load_triple, merge_save_live_ft, merge_save_prediction
+from src.wc_disk_cache import load_triple, merge_save_live_ft, merge_save_prediction, merge_save_predictions_batch
 from src.wc_live_scores import dates_up_to_today_inclusive, fetch_live_scores_by_fixture_idx
+from src.wc_knockout_schedule import (
+    KNOCKOUT_ROUNDS_ORDER,
+    ROUNDS_FROM_R16,
+    get_resolved_knockout_fixtures,
+    round_schedule_status,
+)
+from src import wc_usage_log
 
 # ── 2026 fixture data (ESPN schedule, June 11 results confirmed) ──────────────
 # Keys: group, date, home, away, venue, actual (None if unplayed)
@@ -148,9 +155,11 @@ _KO_FIXTURES: list[dict] = [
     {"round":"Final",         "date":"2026-07-19","label":"2026 World Cup Final",            "venue":"MetLife Stadium, East Rutherford"},
 ]
 
-# Attach a flat index to every fixture so result keys are stable across both tabs
+# Attach a flat index to every group fixture (knockout indices assigned at runtime).
 for _i, _f in enumerate(_FIXTURES):
     _f["_idx"] = _i
+
+_KO_IDX_BASE = len(_FIXTURES)
 
 # Team name map: fixture display name → dataset name (only when they differ)
 _DS_NAME: dict[str, str] = {
@@ -209,6 +218,34 @@ _CSS = """
     .main .block-container { color: #eef6fc; }
     header[data-testid="stHeader"] { background: rgba(26, 51, 82, 0.92); }
     div[data-testid="stToolbar"] { visibility: hidden; height: 0; }
+
+    /* Session visit counter — fixed top-right */
+    .wc-visit-badge {
+        position: fixed;
+        top: 3.75rem;
+        right: 0.85rem;
+        z-index: 999999;
+        display: flex;
+        flex-direction: column;
+        align-items: flex-end;
+        gap: 1px;
+        pointer-events: none;
+        font-family: "Segoe UI", system-ui, sans-serif;
+    }
+    .wc-visit-badge .wc-visit-num {
+        font-size: 1.28rem;
+        font-weight: 900;
+        color: #ffe566;
+        line-height: 1;
+        text-shadow: 0 1px 4px rgba(0,0,0,0.55);
+    }
+    .wc-visit-badge .wc-visit-lbl {
+        font-size: 0.58rem;
+        font-weight: 700;
+        letter-spacing: 0.07em;
+        color: #9ec5e8;
+        text-transform: uppercase;
+    }
 
     .stMarkdown, .stMarkdown p, [data-testid="stMarkdownContainer"] p {
         color: #e8f1fa !important;
@@ -498,6 +535,43 @@ def _inject_styles() -> None:
     st.markdown(_CSS, unsafe_allow_html=True)
 
 
+def _streamlit_session_id() -> str | None:
+    try:
+        from streamlit.runtime.scriptrunner import get_script_run_ctx
+
+        ctx = get_script_run_ctx()
+        sid = getattr(ctx, "session_id", None) if ctx else None
+        return str(sid) if sid else None
+    except Exception:
+        return None
+
+
+def _usage_visitor_label() -> str:
+    return wc_usage_log.visitor_token(_streamlit_session_id())
+
+
+def _record_session_visit_once() -> int:
+    """Count one visit per Streamlit browser session; return total visits on disk."""
+    if st.session_state.get("_wc_visit_counted"):
+        return wc_usage_log.read_visit_count(_ROOT)
+    n = wc_usage_log.increment_visit_count(_ROOT)
+    st.session_state["_wc_visit_counted"] = True
+    return n
+
+
+def _render_visit_badge(n: int) -> None:
+    tip = (
+        "Approximate site traffic: one count per browser tab session when the app loads. "
+        "Prediction runs are logged under data/wc_prediction_log.jsonl (opaque visitor id)."
+    )
+    st.markdown(
+        f'<div class="wc-visit-badge" title="{html.escape(tip)}">'
+        f'<span class="wc-visit-num">{n:,}</span>'
+        f'<span class="wc-visit-lbl">Visits</span></div>',
+        unsafe_allow_html=True,
+    )
+
+
 @st.cache_resource(show_spinner=False)
 def _get_predictor(model: str) -> MatchPredictor:
     """Load and cache the predictor so it is not rebuilt on every button click."""
@@ -521,16 +595,55 @@ def _pred_scoreline_ints(res: dict) -> tuple[int, int] | None:
     return a, b
 
 
+def _is_knockout_fixture(fx: dict) -> bool:
+    """True for R32 through Final (no draws — must pick a side to advance)."""
+    return fx.get("round") in KNOCKOUT_ROUNDS_ORDER
+
+
+def _res_for_fixture(res: dict, fx: dict | None) -> dict:
+    """Attach knockout flag from fixture when missing on stored prediction (older cache)."""
+    if fx and _is_knockout_fixture(fx):
+        return {**res, "knockout": True}
+    return res
+
+
+def _ko_win_probs(res: dict) -> tuple[float, float]:
+    """Home / away win % used for knockout tie-breaks (higher side advances)."""
+    pa = float(res.get("team_a_win_probability", 0.5))
+    pb = float(res.get("team_b_win_probability", 1.0 - pa))
+    return pa, pb
+
+
+def _ko_pick_side(res: dict) -> str:
+    """Knockout tie-break: side with higher win % advances (50/50 → home)."""
+    pa, pb = _ko_win_probs(res)
+    if pa > pb:
+        return "home"
+    if pb > pa:
+        return "away"
+    return "home"
+
+
+def _ko_tiebreak_used(res: dict) -> bool:
+    """True when pred score is level at 90′ so winner comes from win % not goals."""
+    if not res.get("knockout"):
+        return False
+    si = _pred_scoreline_ints(res)
+    return si is not None and si[0] == si[1]
+
+
 def _sign1x2(home_goals: int, away_goals: int) -> int:
     """1 = home win, 0 = draw, -1 = away win (same bucket as home/away goals)."""
     return (home_goals > away_goals) - (home_goals < away_goals)
 
 
 def _predicted_outcome_max_prob(res: dict) -> str | None:
-    """Predicted 1×2 from (p_home, p_draw, p_away). Ties do not default to home (fixes 35/30/35 → draw)."""
+    """Predicted 1×2 from (p_home, p_draw, p_away). Knockout → home or away only."""
     if "_err" in res:
         return None
     pa_raw = res["team_a_win_probability"]
+    if res.get("knockout"):
+        return _ko_pick_side(res)
     p_home, p_draw, p_away = _three_way(pa_raw)
     probs = {"home": p_home, "draw": p_draw, "away": p_away}
     max_p = max(probs.values())
@@ -545,8 +658,9 @@ def _predicted_outcome_max_prob(res: dict) -> str | None:
 
 
 def _predicted_winner_name(res: dict) -> str:
-    """Plain label: home team name, away team name, or Draw (same rule as 1×2 checks)."""
+    """Plain label: home team, away team, or Draw (group stage only)."""
     ta, tb = res["team_a"], res["team_b"]
+    ko = res.get("knockout", False)
     si = _pred_scoreline_ints(res)
     if si is not None:
         ha, aa = si
@@ -554,6 +668,8 @@ def _predicted_winner_name(res: dict) -> str:
             return ta
         if aa > ha:
             return tb
+        if ko:
+            return ta if _ko_pick_side(res) == "home" else tb
         return "Draw"
     po = _predicted_outcome_max_prob(res)
     if po == "home":
@@ -580,6 +696,7 @@ def _prediction_checks(res: dict, actual: str | None) -> dict | None:
         return None
     gh, ga = goals
     act_sign = _sign1x2(gh, ga)
+    ko = res.get("knockout", False)
 
     pred_from_prob = _predicted_outcome_max_prob(res)
     if pred_from_prob is None:
@@ -588,8 +705,12 @@ def _prediction_checks(res: dict, actual: str | None) -> dict | None:
     score_ints = _pred_scoreline_ints(res)
     if score_ints is None:
         pred_s = {"home": 1, "draw": 0, "away": -1}[pred_from_prob]
+        if res.get("knockout") and act_sign == 0:
+            result_ok = None
+        else:
+            result_ok = pred_s == act_sign
         return {
-            "result_ok": pred_s == act_sign,
+            "result_ok": result_ok,
             "score_ok": None,
             "gd_ok": None,
             "exact": False,
@@ -599,6 +720,14 @@ def _prediction_checks(res: dict, actual: str | None) -> dict | None:
     ph_i, pb_i = score_ints
     exact = ph_i == gh and pb_i == ga
     if exact:
+        if ko and act_sign == 0:
+            return {
+                "result_ok": None,
+                "score_ok": True,
+                "gd_ok": True,
+                "exact": True,
+                "show_gd_note": False,
+            }
         return {
             "result_ok": True,
             "score_ok": True,
@@ -608,7 +737,15 @@ def _prediction_checks(res: dict, actual: str | None) -> dict | None:
         }
 
     gd_ok = (ph_i - pb_i) == (gh - ga)
-    result_ok = _sign1x2(ph_i, pb_i) == act_sign
+    if ko:
+        if act_sign == 0:
+            result_ok = None
+        else:
+            pred_side = _predicted_outcome_max_prob(res)
+            act_side = "home" if act_sign > 0 else "away"
+            result_ok = pred_side == act_side
+    else:
+        result_ok = _sign1x2(ph_i, pb_i) == act_sign
     return {
         "result_ok": result_ok,
         "score_ok": False,
@@ -618,8 +755,9 @@ def _prediction_checks(res: dict, actual: str | None) -> dict | None:
     }
 
 
-def _checks_rows_html(ch: dict) -> str:
+def _checks_rows_html(ch: dict, *, knockout: bool = False) -> str:
     """Three fixed rows: match result, scoreline, goal difference."""
+    result_lbl = "Winner to advance" if knockout else "Match result (1×2)"
 
     def one_row(label: str, ok: bool | None) -> str:
         if ok is None:
@@ -644,7 +782,7 @@ def _checks_rows_html(ch: dict) -> str:
 
     return (
         '<div style="margin-top:6px;border-top:1px solid rgba(255,255,255,0.12);padding-top:6px">'
-        f'{one_row("Match result (1×2)", ch.get("result_ok"))}'
+        f'{one_row(result_lbl, ch.get("result_ok"))}'
         f'{one_row("Scoreline", ch.get("score_ok"))}'
         f'{one_row("Goal difference", ch.get("gd_ok"))}'
         f"{note}</div>"
@@ -680,14 +818,10 @@ def _ft_winner_name(team_a: str, team_b: str, actual: str) -> str | None:
     return "Draw"
 
 
-def _three_way(pa_raw: float) -> tuple[float, float, float]:
-    """Convert binary win-prob to (p_home, p_draw, p_away) using context-sensitive draw rate.
-
-    Draw probability is highest (~30 %) for evenly matched sides and falls
-    toward ~8 % as the mismatch grows — matching WC group-stage empirics.
-    The binary classifier implicitly conditions on a result happening, so we
-    rescale both win probs by (1 - p_draw) after computing the draw share.
-    """
+def _three_way(pa_raw: float, *, knockout: bool = False) -> tuple[float, float, float]:
+    """Convert binary win-prob to (p_home, p_draw, p_away). Knockout: no draw mass."""
+    if knockout:
+        return pa_raw, 0.0, 1.0 - pa_raw
     strength_diff = abs(pa_raw - 0.5)          # 0 = even, 0.5 = maximum mismatch
     p_draw = max(0.08, 0.30 - strength_diff * 0.44)
     p_home = pa_raw * (1.0 - p_draw)
@@ -695,30 +829,33 @@ def _three_way(pa_raw: float) -> tuple[float, float, float]:
     return p_home, p_draw, p_away
 
 
-def _fixture_result_html(res: dict, actual: str | None = None) -> str:
-    """Predicted winner (or Draw) + pred score + vs-FT winner check + score/GD rows."""
+def _fixture_result_html(res: dict, actual: str | None = None, *, fx: dict | None = None) -> str:
+    """Predicted winner + pred score + vs-FT check. Knockout: always a side to advance."""
+    res = _res_for_fixture(res, fx)
+    ko = res.get("knockout", False)
     ta_raw, tb_raw = res["team_a"], res["team_b"]
     pred_lbl = _predicted_winner_name(res)
     pred_esc = html.escape(pred_lbl)
-    pred_cls = "fx-pred-draw" if pred_lbl == "Draw" else "fx-pred-winner"
+    pred_cls = "fx-pred-winner"
 
     ch = _prediction_checks(res, actual) if actual else None
-    checks_html = _checks_rows_html(ch) if ch else ""
+    checks_html = _checks_rows_html(ch, knockout=ko) if ch else ""
 
     ft_line = ""
     if actual:
         ft_lbl = _ft_winner_name(ta_raw, tb_raw, actual)
         if ft_lbl is not None:
             ft_esc = html.escape(ft_lbl)
-            ft_cls = "fx-pred-draw" if ft_lbl == "Draw" else "fx-pred-winner"
+            ft_cls = "fx-pred-draw" if ft_lbl == "Draw" and not ko else "fx-pred-winner"
             cmp_bit = ""
             if ch is not None and ch.get("result_ok") is not None:
                 if ch["result_ok"]:
                     cmp_bit = ' <span style="color:#7fd4a0;font-weight:800">· Match ✓</span>'
                 else:
                     cmp_bit = ' <span style="color:#f08080;font-weight:800">· No match ✗</span>'
+            ft_hdr = "FT (90 min)" if ko and ft_lbl == "Draw" else "FT winner"
             ft_line = (
-                f'<div class="fx-pred-ft">FT winner: <span class="{ft_cls}">{ft_esc}</span>{cmp_bit}</div>'
+                f'<div class="fx-pred-ft">{ft_hdr}: <span class="{ft_cls}">{ft_esc}</span>{cmp_bit}</div>'
             )
 
     score_bit = ""
@@ -726,13 +863,25 @@ def _fixture_result_html(res: dict, actual: str | None = None) -> str:
     if _ps is not None:
         score_bit = (
             f'<span style="color:#ffe08a;font-size:0.7rem">'
-            f'Pred score: {_ps[0]}–{_ps[1]}'
+            f'Pred score (90′): {_ps[0]}–{_ps[1]}'
             f'</span> &nbsp;'
         )
 
+    tiebreak_bit = ""
+    if ko and _ko_tiebreak_used(res):
+        pa, pb = _ko_win_probs(res)
+        tiebreak_bit = (
+            f'<div style="font-size:0.68rem;color:#9cf0ff;margin-top:3px">'
+            f'Level at 90′ — tie-break by win %: '
+            f'{html.escape(ta_raw)} {pa * 100:.0f}% · '
+            f'{html.escape(tb_raw)} {pb * 100:.0f}%</div>'
+        )
+
+    head = "To advance" if ko else "Prediction"
     return (
         f'<div class="fx-pred">⚡ '
-        f'<div class="fx-pred-main">Prediction: <span class="{pred_cls}">{pred_esc}</span></div>'
+        f'<div class="fx-pred-main">{head}: <span class="{pred_cls}">{pred_esc}</span></div>'
+        f"{tiebreak_bit}"
         f"{ft_line}"
         f'<span style="display:inline-flex;flex-wrap:wrap;gap:2px 4px;align-items:baseline">'
         f"{score_bit}</span>"
@@ -754,31 +903,70 @@ def _outcome_from_actual(actual: str | None) -> str | None:
     return _outcome_from_goals(g[0], g[1])
 
 
-def _run_prediction(fx: dict, team_set: set, model: str) -> None:
-    """Run model for a fixture; store prediction + reasoning in session_state."""
+def _run_predictions_batch(
+    fixtures: list[dict],
+    team_set: set,
+    model: str,
+    *,
+    source: str,
+) -> None:
+    """Run predictions for many fixtures; one disk write at the end."""
+    batch: list[tuple[int, dict[str, Any], dict[str, Any] | None]] = []
+    for fx in fixtures:
+        _run_prediction(fx, team_set, model, source=source, persist_disk=False)
+        idx = fx["_idx"]
+        if f"res_fx_{idx}" in st.session_state:
+            batch.append(
+                (idx, st.session_state[f"res_fx_{idx}"], st.session_state.get(f"rsn_fx_{idx}"))
+            )
+    merge_save_predictions_batch(_ROOT, batch)
+
+
+def _run_prediction(fx: dict, team_set: set, model: str, *, source: str = "ui", persist_disk: bool = True) -> bool:
+    """Run model for a fixture; store prediction + reasoning in session_state. Returns True on success."""
     idx = fx["_idx"]
-    h_ds = _ds(fx["home"], team_set)
-    a_ds = _ds(fx["away"], team_set)
-    if h_ds and a_ds:
-        pred = _get_predictor(model)
-        date, tourn = fx["date"], "FIFA World Cup"
-        pa = pred.team_a_win_probability(h_ds, a_ds, date, tourn, neutral=True)
-        eg_a, eg_b = pred.expected_goals(h_ds, a_ds, date, tourn, neutral=True)
-        res: dict = {
-            "team_a": h_ds,
-            "team_b": a_ds,
-            "team_a_win_probability": round(pa, 4),
-            "team_b_win_probability": round(1.0 - pa, 4),
-        }
-        if eg_a is not None:
-            res["team_a_expected_goals"] = eg_a
-            res["team_b_expected_goals"] = eg_b
-        st.session_state[f"res_fx_{idx}"] = res
-        st.session_state[f"rsn_fx_{idx}"] = pred.reasoning(h_ds, a_ds, date, tourn, neutral=True)
-        merge_save_prediction(_ROOT, idx, res, st.session_state[f"rsn_fx_{idx}"])
-    else:
+    try:
+        h_ds = _ds(fx["home"], team_set)
+        a_ds = _ds(fx["away"], team_set)
+        if h_ds and a_ds:
+            pred = _get_predictor(model)
+            date, tourn = fx["date"], "FIFA World Cup"
+            pa = pred.team_a_win_probability(h_ds, a_ds, date, tourn, neutral=True)
+            eg_a, eg_b = pred.expected_goals(h_ds, a_ds, date, tourn, neutral=True)
+            res: dict = {
+                "team_a": h_ds,
+                "team_b": a_ds,
+                "team_a_win_probability": round(pa, 4),
+                "team_b_win_probability": round(1.0 - pa, 4),
+                "knockout": _is_knockout_fixture(fx),
+            }
+            if eg_a is not None:
+                res["team_a_expected_goals"] = eg_a
+                res["team_b_expected_goals"] = eg_b
+            st.session_state[f"res_fx_{idx}"] = res
+            st.session_state[f"rsn_fx_{idx}"] = pred.reasoning(h_ds, a_ds, date, tourn, neutral=True)
+            if persist_disk:
+                merge_save_prediction(_ROOT, idx, res, st.session_state[f"rsn_fx_{idx}"])
+            try:
+                wc_usage_log.append_prediction_event(
+                    _ROOT,
+                    visitor=_usage_visitor_label(),
+                    source=source,
+                    fixture_idx=idx,
+                    home=fx["home"],
+                    away=fx["away"],
+                    model=model,
+                    res=res,
+                )
+            except OSError:
+                pass
+            return True
         missing = [t for t in (fx["home"], fx["away"]) if not _ds(t, team_set)]
         st.session_state[f"res_fx_{idx}"] = {"_err": f"Not in dataset: {', '.join(missing)}"}
+        return False
+    except Exception as exc:
+        st.session_state[f"res_fx_{idx}"] = {"_err": str(exc)}
+        return False
 
 
 def _render_reasoning_html(rsn: dict) -> str:
@@ -944,8 +1132,13 @@ def _render_fixture_row(
             )
         else:
             if st.button("Predict ▶", key=f"btn_{tab_prefix}_{idx}", use_container_width=True):
-                with st.spinner(""):
-                    _run_prediction(fx, team_set, model)
+                with st.spinner("Predicting…"):
+                    ok = _run_prediction(fx, team_set, model, source="fixture_button")
+                stored = st.session_state.get(f"res_fx_{idx}")
+                if ok and stored and "_err" not in stored:
+                    disp = _res_for_fixture(stored, fx)
+                    label = "To advance" if disp.get("knockout") else "Prediction"
+                    st.toast(f"{label}: {_predicted_winner_name(disp)}")
 
     with c_res:
         stored = st.session_state.get(f"res_fx_{idx}")
@@ -957,7 +1150,7 @@ def _render_fixture_row(
                     unsafe_allow_html=True,
                 )
             else:
-                st.markdown(_fixture_result_html(stored, actual=actual), unsafe_allow_html=True)
+                st.markdown(_fixture_result_html(stored, actual=actual, fx=fx), unsafe_allow_html=True)
 
     # Reasoning expander — full width, below the row
     rsn = st.session_state.get(f"rsn_fx_{idx}")
@@ -966,74 +1159,122 @@ def _render_fixture_row(
             st.markdown(_render_reasoning_html(rsn), unsafe_allow_html=True)
 
 
-def _show_fixtures_tab(team_set: set, fixture_model: str, live_by_idx: dict[int, str]) -> None:
-    """Render the Fixtures tab: group tabs A-L + Knockout."""
-    groups = sorted({f["group"] for f in _FIXTURES})  # A..L
-    tab_labels = [f"Group {g}" for g in groups] + ["🔄 Knockout"]
-    tabs = st.tabs(tab_labels)
+def _render_knockout_fixtures(
+    team_set: set,
+    fixture_model: str,
+    live_by_idx: dict[int, str],
+    ko_fixtures: list[dict],
+    ko_cache: dict[str, Any],
+) -> None:
+    ko_by_round: dict[str, list[dict]] = {}
+    for fx in ko_fixtures:
+        ko_by_round.setdefault(fx["round"], []).append(fx)
 
-    # Group tabs
-    for ti, grp in enumerate(groups):
-        with tabs[ti]:
-            grp_fixtures = [f for f in _FIXTURES if f["group"] == grp]
-            grp_teams = sorted({t for f in grp_fixtures for t in (f["home"], f["away"])})
-            st.markdown(
-                f'<div style="color:#ffe08a;font-weight:700;font-size:0.8rem;'
-                f'letter-spacing:0.1em;margin-bottom:6px">GROUP {grp} — {" · ".join(grp_teams)}</div>',
-                unsafe_allow_html=True,
-            )
+    st.markdown(
+        '<div style="color:#dceaf5;font-size:0.88rem;margin-bottom:10px">'
+        'Knockout pairings load from ESPN when teams are known. '
+        'Complete rounds are cached locally (<code>data/wc_knockout_schedule.json</code>).</div>',
+        unsafe_allow_html=True,
+    )
 
-            for fx in grp_fixtures:
-                _render_fixture_row(fx, team_set, fixture_model, show_date=True, tab_prefix="tab2", live_by_idx=live_by_idx)
+    display_rounds = [r for r in KNOCKOUT_ROUNDS_ORDER if r in ROUNDS_FROM_R16 or ko_by_round.get(r)]
+    if "Round of 32" in ko_by_round and "Round of 32" not in display_rounds:
+        display_rounds = ["Round of 32"] + list(display_rounds)
 
-            # Quick "Predict all" button for this group
-            st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
-            unplayed = [fx for fx in grp_fixtures if not _effective_actual(fx, live_by_idx)]
-            if unplayed and st.button(f"Predict all Group {grp} matches", key=f"pred_all_{grp}"):
-                for fx in unplayed:
-                    _run_prediction(fx, team_set, fixture_model)
-                st.rerun()
-
-    # Knockout tab
-    with tabs[-1]:
+    for rnd in display_rounds:
+        have, exp, complete = round_schedule_status(ko_cache, rnd)
         st.markdown(
-            '<div style="color:#dceaf5;font-size:0.88rem;margin-bottom:10px">'
-            'Knockout fixtures are determined by group stage results. '
-            'Teams shown as TBD until groups conclude.</div>',
+            f'<div style="color:#ffe08a;font-weight:700;font-size:0.78rem;'
+            f'letter-spacing:0.09em;margin:10px 0 4px;text-transform:uppercase">'
+            f'{html.escape(rnd)}'
+            f'<span style="color:#8bb8d0;font-weight:600;margin-left:8px;font-size:0.68rem">'
+            f'({have}/{exp} pairings)</span></div>',
             unsafe_allow_html=True,
         )
-        cur_round = None
-        for ko in _KO_FIXTURES:
-            if ko["round"] != cur_round:
-                cur_round = ko["round"]
+
+        resolved = ko_by_round.get(rnd) or []
+        if resolved:
+            for fx in resolved:
+                _render_fixture_row(
+                    fx, team_set, fixture_model, show_date=True, tab_prefix="ko", live_by_idx=live_by_idx
+                )
+            unplayed = [fx for fx in resolved if not _effective_actual(fx, live_by_idx)]
+            if unplayed and st.button(
+                f"Predict all {rnd} ({len(unplayed)} unplayed)",
+                key=f"pred_all_ko_{rnd.replace(' ', '_')}",
+            ):
+                with st.spinner(f"Predicting {len(unplayed)} matches…"):
+                    _run_predictions_batch(unplayed, team_set, fixture_model, source="predict_all_ko")
+                st.toast(f"Predictions saved for {len(unplayed)} {rnd} match(es)")
+
+        if not complete and not resolved:
+            pending = [k for k in _KO_FIXTURES if k["round"] == rnd]
+            for ko in pending:
                 st.markdown(
-                    f'<div style="color:#ffe08a;font-weight:700;font-size:0.78rem;'
-                    f'letter-spacing:0.09em;margin:10px 0 4px;text-transform:uppercase">'
-                    f'{html.escape(cur_round)}</div>',
+                    f'<div style="padding:3px 8px;border-bottom:1px solid rgba(255,255,255,0.06);'
+                    f'color:#6a8aa0;font-size:0.8rem">'
+                    f'<span style="color:#5a8098">{ko["date"][5:]} &nbsp;</span>'
+                    f'{html.escape(ko["label"])}'
+                    f'<span style="color:#4a6a80;font-style:italic;font-size:0.72rem">'
+                    f' &nbsp;· 📍 {html.escape(ko["venue"])} · awaiting teams</span></div>',
                     unsafe_allow_html=True,
                 )
-            st.markdown(
-                f'<div style="padding:3px 8px;border-bottom:1px solid rgba(255,255,255,0.06);'
-                f'color:#8bb8d0;font-size:0.8rem">'
-                f'<span style="color:#6fa8c0">{ko["date"][5:]} &nbsp;</span>'
-                f'{html.escape(ko["label"])}'
-                f'<span style="color:#4a7a98;font-style:italic;font-size:0.72rem">'
-                f' &nbsp;· 📍 {html.escape(ko["venue"])}</span></div>',
-                unsafe_allow_html=True,
-            )
+        elif not complete and resolved:
+            st.caption(f"{exp - have} more {rnd} pairing(s) will appear when earlier knockout games finish.")
 
 
-def _accuracy_eval_rows(live_by_idx: dict[int, str]) -> list[dict[str, Any]]:
+def _show_fixtures_tab(
+    team_set: set,
+    fixture_model: str,
+    live_by_idx: dict[int, str],
+    ko_fixtures: list[dict],
+    ko_cache: dict[str, Any],
+) -> None:
+    """Render the Fixtures tab: group picker (persists across reruns) + Knockout."""
+    groups = sorted({f["group"] for f in _FIXTURES})
+    view_options = [f"Group {g}" for g in groups] + ["🔄 Knockout"]
+    fixtures_view = st.selectbox(
+        "Browse fixtures",
+        view_options,
+        key="wc_fixtures_view",
+    )
+
+    if fixtures_view == "🔄 Knockout":
+        _render_knockout_fixtures(team_set, fixture_model, live_by_idx, ko_fixtures, ko_cache)
+        return
+
+    grp = fixtures_view.replace("Group ", "")
+    grp_fixtures = [f for f in _FIXTURES if f["group"] == grp]
+    grp_teams = sorted({t for f in grp_fixtures for t in (f["home"], f["away"])})
+    st.markdown(
+        f'<div style="color:#ffe08a;font-weight:700;font-size:0.8rem;'
+        f'letter-spacing:0.1em;margin-bottom:6px">GROUP {grp} — {" · ".join(grp_teams)}</div>',
+        unsafe_allow_html=True,
+    )
+
+    for fx in grp_fixtures:
+        _render_fixture_row(fx, team_set, fixture_model, show_date=True, tab_prefix="tab2", live_by_idx=live_by_idx)
+
+    st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
+    unplayed = [fx for fx in grp_fixtures if not _effective_actual(fx, live_by_idx)]
+    if unplayed and st.button(f"Predict all Group {grp} matches", key=f"pred_all_{grp}"):
+        with st.spinner(f"Predicting {len(unplayed)} matches…"):
+            _run_predictions_batch(unplayed, team_set, fixture_model, source="predict_all_group")
+        st.toast(f"Predictions saved for Group {grp}")
+
+
+def _accuracy_eval_rows(active_fixtures: list[dict], live_by_idx: dict[int, str]) -> list[dict[str, Any]]:
     """Fixtures with FT + stored prediction + check dict (same set as accuracy hero)."""
     out: list[dict[str, Any]] = []
-    for fx in _FIXTURES:
+    for fx in active_fixtures:
         actual = _effective_actual(fx, live_by_idx)
         if not actual:
             continue
         stored = st.session_state.get(f"res_fx_{fx['_idx']}")
         if not stored or "_err" in stored:
             continue
-        ch = _prediction_checks(stored, actual)
+        res = _res_for_fixture(stored, fx)
+        ch = _prediction_checks(res, actual)
         if ch is None:
             continue
         out.append({"fx": fx, "stored": stored, "ch": ch, "actual": actual})
@@ -1044,8 +1285,8 @@ def _accuracy_split_ok_bad(
     rows: list[dict[str, Any]], kind: Literal["result", "score", "gd"]
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     if kind == "result":
-        ok = [r for r in rows if r["ch"].get("result_ok")]
-        bad = [r for r in rows if not r["ch"].get("result_ok")]
+        ok = [r for r in rows if r["ch"].get("result_ok") is True]
+        bad = [r for r in rows if r["ch"].get("result_ok") is False]
         return ok, bad
     if kind == "score":
         sub = [r for r in rows if r["ch"].get("score_ok") is not None]
@@ -1062,8 +1303,11 @@ def _accuracy_match_line_html(r: dict[str, Any]) -> str:
     fx, stored, actual = r["fx"], r["stored"], r["actual"]
     ps = _pred_scoreline_ints(stored)
     pred_sc = f"{ps[0]}–{ps[1]}" if ps is not None else "—"
+    stage = fx.get("group")
+    if stage is None:
+        stage = fx.get("round", "KO")
     return (
-        f'{html.escape(fx["date"])} · Grp {html.escape(str(fx["group"]))} · '
+        f'{html.escape(fx["date"])} · {html.escape(str(stage))} · '
         f'{html.escape(fx["home"])} vs {html.escape(fx["away"])} · '
         f'Pred {html.escape(pred_sc)} · FT {html.escape(actual)}'
     )
@@ -1094,9 +1338,62 @@ def _accuracy_expander_colored(rows: list[dict[str, Any]], kind: Literal["result
     st.markdown("".join(parts), unsafe_allow_html=True)
 
 
-def _render_accuracy_hero(live_by_idx: dict[int, str]) -> None:
+def _load_app_context(team_set: set, today: datetime.date) -> dict[str, Any]:
+    """Load scores + knockout schedule once per session (avoids ~8s ESPN refetch every click)."""
+    if st.session_state.get("_wc_ctx_loaded"):
+        return st.session_state["_wc_ctx"]
+
+    with st.spinner("Loading knockout schedule, scores and predictions…"):
+        _get_predictor("xgboost")
+        ko_fixtures, ko_cache = get_resolved_knockout_fixtures(
+            _ROOT, today, idx_base=_KO_IDX_BASE
+        )
+        active_fixtures = _FIXTURES + ko_fixtures
+
+        dates = sorted({datetime.date.fromisoformat(f["date"]) for f in active_fixtures})
+        first, last = dates[0], dates[-1]
+        picker_default = max(first, min(last, today))
+
+        ymds = dates_up_to_today_inclusive(first.isoformat(), last.isoformat(), today)
+
+        live_disk, preds_disk, rsn_disk = load_triple(_ROOT)
+        for _idx, _res in preds_disk.items():
+            st.session_state.setdefault(f"res_fx_{_idx}", _res)
+        for _idx, _rsn in rsn_disk.items():
+            st.session_state.setdefault(f"rsn_fx_{_idx}", _rsn)
+
+        api_live = fetch_live_scores_by_fixture_idx(active_fixtures, list(ymds))
+        live_by_idx = {**live_disk, **api_live}
+        merge_save_live_ft(_ROOT, live_by_idx)
+
+        if not st.session_state.get("_wc_auto_pred_done"):
+            missing_pred = [
+                fx
+                for fx in active_fixtures
+                if _effective_actual(fx, live_by_idx)
+                and not st.session_state.get(f"res_fx_{fx['_idx']}")
+            ]
+            if missing_pred:
+                _run_predictions_batch(missing_pred, team_set, "xgboost", source="auto_finished")
+            st.session_state["_wc_auto_pred_done"] = True
+
+    ctx = {
+        "ko_fixtures": ko_fixtures,
+        "ko_cache": ko_cache,
+        "active_fixtures": active_fixtures,
+        "live_by_idx": live_by_idx,
+        "first": first,
+        "last": last,
+        "picker_default": picker_default,
+    }
+    st.session_state["_wc_ctx"] = ctx
+    st.session_state["_wc_ctx_loaded"] = True
+    return ctx
+
+
+def _render_accuracy_hero(active_fixtures: list[dict], live_by_idx: dict[int, str]) -> None:
     """Predictions-so-far summary; open MATCH RESULT / EXACT SCORE / GOAL DIFFERENCE for green/red lists."""
-    rows = _accuracy_eval_rows(live_by_idx)
+    rows = _accuracy_eval_rows(active_fixtures, live_by_idx)
     if not rows:
         st.markdown(
             '<div class="wc-acc-hero">'
@@ -1204,6 +1501,7 @@ def main() -> None:
         initial_sidebar_state="collapsed",
     )
     _inject_styles()
+    _render_visit_badge(_record_session_visit_once())
 
     # Build team set (used by _ds() for name normalisation)
     _matches = load_completed_matches_chronological(
@@ -1211,21 +1509,7 @@ def main() -> None:
     )
     team_set = {m["home_team"] for m in _matches} | {m["away_team"] for m in _matches}
 
-    # Sorted unique dates with fixtures (for date_input bounds)
-    _dates = sorted({datetime.date.fromisoformat(f["date"]) for f in _FIXTURES})
-    _first, _last = _dates[0], _dates[-1]
     _today = datetime.date.today()
-    _picker_default = max(_first, min(_last, _today))
-
-    _first_s = _first.isoformat()
-    _last_s = _last.isoformat()
-    _ymds = dates_up_to_today_inclusive(_first_s, _last_s, _today)
-
-    live_disk, preds_disk, rsn_disk = load_triple(_ROOT)
-    for _idx, _res in preds_disk.items():
-        st.session_state.setdefault(f"res_fx_{_idx}", _res)
-    for _idx, _rsn in rsn_disk.items():
-        st.session_state.setdefault(f"rsn_fx_{_idx}", _rsn)
 
     st.markdown(
         '<div class="wc-hero"><div class="wc-badge">USA · CAN · MEX 2026</div>'
@@ -1240,24 +1524,34 @@ def main() -> None:
         unsafe_allow_html=True,
     )
 
-    with st.spinner("Loading scores and predictions…"):
-        _api_live = fetch_live_scores_by_fixture_idx(_FIXTURES, list(_ymds))
-        live_by_idx = {**live_disk, **_api_live}
-        merge_save_live_ft(_ROOT, live_by_idx)
-        missing_pred = [
-            fx
-            for fx in _FIXTURES
-            if _effective_actual(fx, live_by_idx) and f"res_fx_{fx['_idx']}" not in st.session_state
-        ]
-        for fx in missing_pred:
-            _run_prediction(fx, team_set, "xgboost")
+    ctx = _load_app_context(team_set, _today)
 
-    _render_accuracy_hero(live_by_idx)
+    ko_fixtures = ctx["ko_fixtures"]
+    ko_cache = ctx["ko_cache"]
+    active_fixtures = ctx["active_fixtures"]
+    live_by_idx = ctx["live_by_idx"]
+    _first = ctx["first"]
+    _last = ctx["last"]
+    _picker_default = ctx["picker_default"]
 
-    tab_pred, tab_fix = st.tabs(["⚽  Match predictor", "📋  Fixtures & schedule"])
+    _render_accuracy_hero(active_fixtures, live_by_idx)
 
-    # ── Tab 1: Date-based match predictor ────────────────────────────────────
-    with tab_pred:
+    nav1, nav2 = st.columns([5, 1])
+    with nav2:
+        if st.button("Refresh scores", key="wc_refresh_ctx", use_container_width=True):
+            st.session_state.pop("_wc_ctx_loaded", None)
+            st.session_state.pop("_wc_ctx", None)
+            st.rerun()
+    with nav1:
+        main_view = st.radio(
+            "Section",
+            ["⚽  Match predictor", "📋  Fixtures & schedule"],
+            horizontal=True,
+            key="wc_main_view",
+            label_visibility="collapsed",
+        )
+
+    if main_view.startswith("⚽"):
         pred_model = "xgboost"
         sel_date = st.date_input(
             "Match date",
@@ -1268,21 +1562,27 @@ def main() -> None:
         )
 
         date_str = sel_date.isoformat()
-        day_fx = [f for f in _FIXTURES if f["date"] == date_str]
+        day_fx = [f for f in active_fixtures if f["date"] == date_str]
 
         if not day_fx:
             st.info(
-                f"No group-stage matches scheduled for **{sel_date.strftime('%B %d, %Y')}**. "
-                "Try another date — group stage runs Jun 11–27, knockout Jun 28–Jul 19."
+                f"No matches scheduled for **{sel_date.strftime('%B %d, %Y')}**. "
+                "Try another date — group stage Jun 11–27, knockout Jun 28–Jul 19."
             )
         else:
-            # Group the day's fixtures by group letter
-            day_groups = sorted({f["group"] for f in day_fx})
+            day_groups = sorted({f["group"] for f in day_fx if f.get("group")})
+            day_rounds = sorted({f["round"] for f in day_fx if f.get("round")})
+            stage_bits: list[str] = []
+            if day_groups:
+                stage_bits.append(f'Groups {", ".join(day_groups)}')
+            if day_rounds:
+                stage_bits.append(", ".join(day_rounds))
+            stage_line = " — ".join(stage_bits) if stage_bits else "Knockout"
             st.markdown(
                 f'<div style="color:#dceaf5;font-size:0.88rem;margin-bottom:10px">'
                 f'<b>{len(day_fx)}</b> match{"es" if len(day_fx) > 1 else ""} on '
                 f'<b style="color:#ffe08a">{sel_date.strftime("%B %d, %Y")}</b> '
-                f'— Groups {", ".join(day_groups)}</div>',
+                f'— {html.escape(stage_line)}</div>',
                 unsafe_allow_html=True,
             )
 
@@ -1309,12 +1609,11 @@ def main() -> None:
                     type="primary",
                     key="pred_all_today",
                 ):
-                    for fx in unplayed_today:
-                        _run_prediction(fx, team_set, pred_model)
-                    st.rerun()
+                    with st.spinner(f"Predicting {len(unplayed_today)} matches…"):
+                        _run_predictions_batch(unplayed_today, team_set, pred_model, source="predict_all_today")
+                    st.toast(f"Predictions saved for {len(unplayed_today)} match(es) today")
 
-    # ── Tab 2: Full fixtures & schedule ──────────────────────────────────────
-    with tab_fix:
+    else:
         st.markdown(
             '<p style="color:#dceaf5;font-size:0.88rem;margin:0 0 6px 0">'
             'All 72 group-stage matches + knockout schedule. '
@@ -1323,7 +1622,7 @@ def main() -> None:
             unsafe_allow_html=True,
         )
         st.markdown("<div style='height:4px'></div>", unsafe_allow_html=True)
-        _show_fixtures_tab(team_set, "xgboost", live_by_idx)
+        _show_fixtures_tab(team_set, "xgboost", live_by_idx, ko_fixtures, ko_cache)
 
 
 if __name__ == "__main__":
